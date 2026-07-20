@@ -3,11 +3,13 @@ import pandas as pd
 import numpy as np
 import requests
 
-# Forecasting ML Models
+# ML & EPF Forecasting Libraries
 import lightgbm as lgb
 import xgboost as xgb
 from catboost import CatBoostRegressor
-from sklearn.ensemble import RandomForestRegressor
+from sklearn.linear_model import LassoCV
+from sklearn.neural_network import MLPRegressor
+from sklearn.ensemble import StackingRegressor, RandomForestRegressor
 
 st.set_page_config(page_title="Power Market Simulator", layout="wide")
 
@@ -32,16 +34,18 @@ selected_bzn = st.sidebar.selectbox(
     index=0
 )
 
+# MULTI-SELECT FOR EPF MODELS
 selected_models = st.sidebar.multiselect(
     "Select Forecasting Models to Compare",
     options=[
+        "LEAR (Lasso AutoRegressive)",
+        "Deep Neural Net (DNN)",
+        "Stacked EPF Ensemble",
         "LightGBM Forecast",
-        "XGBoost Forecast",
         "CatBoost Forecast",
-        "Random Forest Forecast",
         "24h Moving Average Trend"
     ],
-    default=["LightGBM Forecast"]
+    default=["LEAR (Lasso AutoRegressive)", "Deep Neural Net (DNN)"]
 )
 
 st.sidebar.markdown("---")
@@ -85,38 +89,65 @@ with st.spinner("Fetching Live Market & Weather Inputs..."):
     df_weather = fetch_weather_data()
     df = pd.merge(df_prices, df_weather, left_index=True, right_index=True, how="inner")
 
-# --- ML FEATURE ENGINEERING ---
-features = df[["Solar Irradiance (W/m²)", "Wind Speed (km/h)"]].copy()
-features["Hour"] = df.index.hour
-features["DayOfWeek"] = df.index.dayofweek
-target = df["Day-Ahead Price (€/MWh)"]
+# --- EPF FEATURE ENGINEERING (Autoregressive Lags & Calendar Features) ---
+df_feat = df.copy()
 
-# --- TRAIN SELECTED MODELS ---
+# Add Day-Ahead Autoregressive Lags (24h and 48h prior)
+df_feat["Price_Lag24"] = df_feat["Day-Ahead Price (€/MWh)"].shift(24).bfill()
+df_feat["Price_Lag48"] = df_feat["Day-Ahead Price (€/MWh)"].shift(48).bfill()
+
+# Temporal / Calendar Inputs
+df_feat["Hour"] = df_feat.index.hour
+df_feat["DayOfWeek"] = df_feat.index.dayofweek
+
+feature_cols = [
+    "Solar Irradiance (W/m²)", "Wind Speed (km/h)", 
+    "Price_Lag24", "Price_Lag48", "Hour", "DayOfWeek"
+]
+
+X = df_feat[feature_cols]
+y = df_feat["Day-Ahead Price (€/MWh)"]
+
+
+# --- TRAIN SELECTED EPF MODELS ---
 if "24h Moving Average Trend" in selected_models:
-    df["24h Moving Average Trend"] = df["Day-Ahead Price (€/MWh)"].rolling(window=12, min_periods=1).mean()
+    df["24h Moving Average Trend"] = df["Day-Ahead Price (€/MWh)"].rolling(window=24, min_periods=1).mean()
+
+if "LEAR (Lasso AutoRegressive)" in selected_models:
+    model_lear = LassoCV(cv=3, random_state=42)
+    model_lear.fit(X, y)
+    df["LEAR (Lasso AutoRegressive)"] = model_lear.predict(X)
+
+if "Deep Neural Net (DNN)" in selected_models:
+    model_dnn = MLPRegressor(hidden_layer_sizes=(64, 32), max_iter=300, random_state=42)
+    model_dnn.fit(X, y)
+    df["Deep Neural Net (DNN)"] = model_dnn.predict(X)
 
 if "LightGBM Forecast" in selected_models:
     model_lgb = lgb.LGBMRegressor(n_estimators=100, max_depth=4, verbose=-1, random_state=42)
-    model_lgb.fit(features, target)
-    df["LightGBM Forecast"] = model_lgb.predict(features)
-
-if "XGBoost Forecast" in selected_models:
-    model_xgb = xgb.XGBRegressor(n_estimators=100, max_depth=4, learning_rate=0.08, random_state=42)
-    model_xgb.fit(features, target)
-    df["XGBoost Forecast"] = model_xgb.predict(features)
+    model_lgb.fit(X, y)
+    df["LightGBM Forecast"] = model_lgb.predict(X)
 
 if "CatBoost Forecast" in selected_models:
     model_cat = CatBoostRegressor(iterations=100, depth=4, verbose=0, random_seed=42)
-    model_cat.fit(features, target)
-    df["CatBoost Forecast"] = model_cat.predict(features)
+    model_cat.fit(X, y)
+    df["CatBoost Forecast"] = model_cat.predict(X)
 
-if "Random Forest Forecast" in selected_models:
-    model_rf = RandomForestRegressor(n_estimators=100, max_depth=5, random_state=42)
-    model_rf.fit(features, target)
-    df["Random Forest Forecast"] = model_rf.predict(features)
+if "Stacked EPF Ensemble" in selected_models:
+    estimators = [
+        ('lear', LassoCV(cv=3, random_state=42)),
+        ('lgb', lgb.LGBMRegressor(n_estimators=50, max_depth=3, verbose=-1, random_state=42)),
+        ('cat', CatBoostRegressor(iterations=50, depth=3, verbose=0, random_seed=42))
+    ]
+    stack_model = StackingRegressor(
+        estimators=estimators, 
+        final_estimator=LassoCV(cv=3, random_state=42)
+    )
+    stack_model.fit(X, y)
+    df["Stacked EPF Ensemble"] = stack_model.predict(X)
 
 
-# --- DECISION SUPPORT LAYER (DSL) LOGIC ---
+# --- DECISION SUPPORT LAYER LOGIC ---
 primary_model = selected_models[0] if selected_models else "Day-Ahead Price (€/MWh)"
 
 def generate_decision(row, model_col, buy_t, sell_t):
@@ -133,7 +164,7 @@ df["Trading Signal"] = df.apply(generate_decision, axis=1, model_col=primary_mod
 current_signal = df["Trading Signal"].iloc[-1]
 current_price = df[primary_model].iloc[-1]
 
-# Estimated daily P&L calculation based on capacity
+# Estimated daily P&L calculation
 charge_hours = df[df["Trading Signal"] == "🟢 CHARGE (BUY)"]
 discharge_hours = df[df["Trading Signal"] == "🔴 DISCHARGE (SELL)"]
 
@@ -167,11 +198,11 @@ banner_col3.metric("Projected Daily Arbitrage Spread", f"{projected_spread:.2f} 
 st.markdown("---")
 
 # Visual Charting
-st.subheader(f"📈 Model Prices vs. Execution Triggers")
+st.subheader(f"📈 Next-Day EPF Models vs. Actual Clearing Price")
 chart_cols = ["Day-Ahead Price (€/MWh)"] + selected_models
 st.line_chart(df[chart_cols])
 
-# Execution Signals Schedule
+# Execution Schedule Table
 st.subheader("📋 Next 24-Hour Automated Execution Schedule")
 summary_df = df[[primary_model, "Trading Signal", "Solar Irradiance (W/m²)", "Wind Speed (km/h)"]].head(24)
 
