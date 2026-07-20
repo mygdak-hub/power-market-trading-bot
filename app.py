@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 import requests
 
-# ML & EPF Forecasting Libraries
+# Forecasting ML Models
 import lightgbm as lgb
 import xgboost as xgb
 from catboost import CatBoostRegressor
@@ -25,16 +25,27 @@ MARKET_NAMES = {
 }
 
 # --- SIDEBAR CONTROLS ---
-st.sidebar.header("⚙️ Market & Model Settings")
+st.sidebar.header("⚙️ Market & Product Settings")
 
 selected_bzn = st.sidebar.selectbox(
-    "Select Target Power Market",
+    "Target Power Market",
     options=list(MARKET_NAMES.keys()),
     format_func=lambda x: MARKET_NAMES[x],
     index=0
 )
 
-# MULTI-SELECT FOR EPF MODELS
+# 1. TRADING HORIZON SELECTION
+market_horizon = st.sidebar.radio(
+    "Select Market Product Horizon",
+    options=[
+        "Day-Ahead Spot Market (12:00 Auction)",
+        "Intraday Continuous / Real-Time",
+        "Next-Day Forward Forecast (D+1 / D+2)"
+    ],
+    index=0
+)
+
+# 2. MODEL SELECTION
 selected_models = st.sidebar.multiselect(
     "Select Forecasting Models to Compare",
     options=[
@@ -45,11 +56,11 @@ selected_models = st.sidebar.multiselect(
         "CatBoost Forecast",
         "24h Moving Average Trend"
     ],
-    default=["LEAR (Lasso AutoRegressive)", "Deep Neural Net (DNN)"]
+    default=["LEAR (Lasso AutoRegressive)", "Stacked EPF Ensemble"]
 )
 
 st.sidebar.markdown("---")
-st.sidebar.header("⚡ Battery & Strategy Parameters")
+st.sidebar.header("⚡ Battery Storage Parameters")
 battery_capacity_mwh = st.sidebar.number_input("Battery Storage Capacity (MWh)", value=10, min_value=1)
 buy_threshold = st.sidebar.slider("Charge Trigger Price (€/MWh)", min_value=0, max_value=60, value=35)
 sell_threshold = st.sidebar.slider("Discharge Trigger Price (€/MWh)", min_value=60, max_value=200, value=90)
@@ -84,40 +95,45 @@ def fetch_weather_data(lat=52.52, lon=13.41):
     }).set_index("Timestamp")
 
 
-with st.spinner("Fetching Live Market & Weather Inputs..."):
+with st.spinner("Fetching Market Data..."):
     df_prices = fetch_fraunhofer_prices(selected_bzn)
     df_weather = fetch_weather_data()
     df = pd.merge(df_prices, df_weather, left_index=True, right_index=True, how="inner")
 
-# --- EPF FEATURE ENGINEERING & CLEANING ---
+# --- DERIVE INTRADAY & FORWARD MARKET DATA ---
+# Synthetic Intraday spread volatility model based on real solar/wind ramp rates
+np.random.seed(42)
+ramp_factor = (df["Solar Irradiance (W/m²)"].diff().fillna(0) / 100)
+df["Intraday Continuous (€/MWh)"] = df["Day-Ahead Price (€/MWh)"] + (ramp_factor * 5) + np.random.normal(0, 3, len(df))
+
+# Forward D+1 Shifted Curve
+df["Next-Day Forward Curve (€/MWh)"] = df["Day-Ahead Price (€/MWh)"].shift(-24).bfill()
+
+# --- FEATURE ENGINEERING ---
 df_feat = df.copy()
-
-# 1. Create Day-Ahead Autoregressive Lags
-df_feat["Price_Lag24"] = df_feat["Day-Ahead Price (€/MWh)"].shift(24)
-df_feat["Price_Lag48"] = df_feat["Day-Ahead Price (€/MWh)"].shift(48)
-
-# 2. Fill Missing Values (bfill/ffill handles top rows created by shifting)
-df_feat["Price_Lag24"] = df_feat["Price_Lag24"].bfill().ffill()
-df_feat["Price_Lag48"] = df_feat["Price_Lag48"].bfill().ffill()
-df_feat["Day-Ahead Price (€/MWh)"] = df_feat["Day-Ahead Price (€/MWh)"].bfill().ffill()
-
-# 3. Temporal Inputs
+df_feat["Price_Lag24"] = df_feat["Day-Ahead Price (€/MWh)"].shift(24).bfill().ffill()
+df_feat["Price_Lag48"] = df_feat["Day-Ahead Price (€/MWh)"].shift(48).bfill().ffill()
 df_feat["Hour"] = df_feat.index.hour
 df_feat["DayOfWeek"] = df_feat.index.dayofweek
 
-feature_cols = [
-    "Solar Irradiance (W/m²)", "Wind Speed (km/h)", 
-    "Price_Lag24", "Price_Lag48", "Hour", "DayOfWeek"
-]
-
-# Ensure zero NaN values exist in X or y
+feature_cols = ["Solar Irradiance (W/m²)", "Wind Speed (km/h)", "Price_Lag24", "Price_Lag48", "Hour", "DayOfWeek"]
 X = df_feat[feature_cols].fillna(0)
-y = df_feat["Day-Ahead Price (€/MWh)"].fillna(0)
+
+# Set target based on selected horizon
+if "Intraday" in market_horizon:
+    y = df_feat["Intraday Continuous (€/MWh)"].fillna(0)
+    base_price_col = "Intraday Continuous (€/MWh)"
+elif "Next-Day" in market_horizon:
+    y = df_feat["Next-Day Forward Curve (€/MWh)"].fillna(0)
+    base_price_col = "Next-Day Forward Curve (€/MWh)"
+else:
+    y = df_feat["Day-Ahead Price (€/MWh)"].fillna(0)
+    base_price_col = "Day-Ahead Price (€/MWh)"
 
 
-# --- TRAIN SELECTED EPF MODELS ---
+# --- TRAIN ML MODELS ---
 if "24h Moving Average Trend" in selected_models:
-    df["24h Moving Average Trend"] = df["Day-Ahead Price (€/MWh)"].rolling(window=24, min_periods=1).mean()
+    df["24h Moving Average Trend"] = df[base_price_col].rolling(window=24, min_periods=1).mean()
 
 if "LEAR (Lasso AutoRegressive)" in selected_models:
     model_lear = LassoCV(cv=3, random_state=42)
@@ -145,16 +161,13 @@ if "Stacked EPF Ensemble" in selected_models:
         ('lgb', lgb.LGBMRegressor(n_estimators=50, max_depth=3, verbose=-1, random_state=42)),
         ('cat', CatBoostRegressor(iterations=50, depth=3, verbose=0, random_seed=42))
     ]
-    stack_model = StackingRegressor(
-        estimators=estimators, 
-        final_estimator=LassoCV(cv=3, random_state=42)
-    )
+    stack_model = StackingRegressor(estimators=estimators, final_estimator=LassoCV(cv=3, random_state=42))
     stack_model.fit(X, y)
     df["Stacked EPF Ensemble"] = stack_model.predict(X)
 
 
 # --- DECISION SUPPORT LAYER LOGIC ---
-primary_model = selected_models[0] if selected_models else "Day-Ahead Price (€/MWh)"
+primary_model = selected_models[0] if selected_models else base_price_col
 
 def generate_decision(row, model_col, buy_t, sell_t):
     price = row[model_col]
@@ -170,7 +183,6 @@ df["Trading Signal"] = df.apply(generate_decision, axis=1, model_col=primary_mod
 current_signal = df["Trading Signal"].iloc[-1]
 current_price = df[primary_model].iloc[-1]
 
-# Estimated daily P&L calculation
 charge_hours = df[df["Trading Signal"] == "🟢 CHARGE (BUY)"]
 discharge_hours = df[df["Trading Signal"] == "🔴 DISCHARGE (SELL)"]
 
@@ -182,11 +194,11 @@ estimated_daily_pnl = projected_spread * battery_capacity_mwh
 
 # --- DASHBOARD UI ---
 st.title("⚡ Short-Term Power Market Trading Simulator")
-st.markdown(f"### 📍 Active Market: **{MARKET_NAMES[selected_bzn]}**")
+st.markdown(f"### 📍 Active Market: **{MARKET_NAMES[selected_bzn]}** | Product: **{market_horizon}**")
 
 st.markdown("---")
 
-# 🤖 DECISION SUPPORT BANNER
+# Decision Support Banner
 st.subheader("🤖 Algorithmic Decision Support Recommendation")
 
 banner_col1, banner_col2, banner_col3 = st.columns(3)
@@ -198,18 +210,18 @@ elif "DISCHARGE" in current_signal:
 else:
     banner_col1.info(f"### Current Action: {current_signal}")
 
-banner_col2.metric(f"Current Signal Price ({primary_model})", f"{current_price:.2f} €/MWh")
-banner_col3.metric("Projected Daily Arbitrage Spread", f"{projected_spread:.2f} €/MWh", delta=f"~€{estimated_daily_pnl:.2f} / day")
+banner_col2.metric(f"Signal Price ({primary_model})", f"{current_price:.2f} €/MWh")
+banner_col3.metric("Projected Arbitrage Spread", f"{projected_spread:.2f} €/MWh", delta=f"~€{estimated_daily_pnl:.2f} / day")
 
 st.markdown("---")
 
-# Visual Charting
-st.subheader(f"📈 Next-Day EPF Models vs. Actual Clearing Price")
-chart_cols = ["Day-Ahead Price (€/MWh)"] + selected_models
+# Charting
+st.subheader(f"📈 Price Curve & Models ({market_horizon})")
+chart_cols = [base_price_col] + selected_models
 st.line_chart(df[chart_cols])
 
-# Execution Schedule Table
-st.subheader("📋 Next 24-Hour Automated Execution Schedule")
+# Execution Table
+st.subheader("📋 Next 24-Hour Execution Schedule")
 summary_df = df[[primary_model, "Trading Signal", "Solar Irradiance (W/m²)", "Wind Speed (km/h)"]].head(24)
 
 st.dataframe(summary_df.style.map(
