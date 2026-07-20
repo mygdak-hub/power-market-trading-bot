@@ -96,6 +96,19 @@ def fetch_weather_data(lat=52.52, lon=13.41):
 with st.spinner("Fetching Market Data..."):
     df_prices = fetch_fraunhofer_prices(selected_bzn)
     df_weather = fetch_weather_data()
+    
+    # 1. Standardize both indexes to UTC timezone to eliminate 1-2 hour shifts
+    if df_prices.index.tz is None:
+        df_prices.index = df_prices.index.tz_localize("UTC")
+    else:
+        df_prices.index = df_prices.index.tz_convert("UTC")
+
+    if df_weather.index.tz is None:
+        df_weather.index = df_weather.index.tz_localize("UTC")
+    else:
+        df_weather.index = df_weather.index.tz_convert("UTC")
+    
+    # 2. Merge aligned UTC datasets
     df = pd.merge(df_prices, df_weather, left_index=True, right_index=True, how="inner")
 
 # --- MARKET HORIZONS ---
