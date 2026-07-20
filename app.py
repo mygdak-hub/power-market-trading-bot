@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 import requests
 
-# Machine Learning Forecasting Models
+# Forecasting ML Models
 import lightgbm as lgb
 import xgboost as xgb
 from catboost import CatBoostRegressor
@@ -32,16 +32,17 @@ selected_bzn = st.sidebar.selectbox(
     index=0
 )
 
-selected_model = st.sidebar.selectbox(
-    "Select Forecasting Model",
+# MULTI-SELECT WIDGET FOR MODELS
+selected_models = st.sidebar.multiselect(
+    "Select Forecasting Models to Compare",
     options=[
-        "Actual Spot Price (Fraunhofer ISE)",
         "LightGBM Forecast",
         "XGBoost Forecast",
         "CatBoost Forecast",
         "Random Forest Forecast",
         "24h Moving Average Trend"
-    ]
+    ],
+    default=["LightGBM Forecast", "CatBoost Forecast"]  # Pre-select two for initial comparison
 )
 
 st.sidebar.markdown("---")
@@ -90,30 +91,29 @@ features["Hour"] = df.index.hour
 features["DayOfWeek"] = df.index.dayofweek
 target = df["Day-Ahead Price (€/MWh)"]
 
-# --- MODEL TRAINING & PREDICTION ---
-df["24h Moving Average Trend"] = df["Day-Ahead Price (€/MWh)"].rolling(window=12, min_periods=1).mean()
+# --- TRAIN & PREDICT SELECTED MODELS ---
+if "24h Moving Average Trend" in selected_models:
+    df["24h Moving Average Trend"] = df["Day-Ahead Price (€/MWh)"].rolling(window=12, min_periods=1).mean()
 
-if "LightGBM" in selected_model:
-    model = lgb.LGBMRegressor(n_estimators=100, max_depth=4, verbose=-1, random_state=42)
-    model.fit(features, target)
-    df["LightGBM Forecast"] = model.predict(features)
+if "LightGBM Forecast" in selected_models:
+    model_lgb = lgb.LGBMRegressor(n_estimators=100, max_depth=4, verbose=-1, random_state=42)
+    model_lgb.fit(features, target)
+    df["LightGBM Forecast"] = model_lgb.predict(features)
 
-elif "XGBoost" in selected_model:
-    model = xgb.XGBRegressor(n_estimators=100, max_depth=4, learning_rate=0.08, random_state=42)
-    model.fit(features, target)
-    df["XGBoost Forecast"] = model.predict(features)
+if "XGBoost Forecast" in selected_models:
+    model_xgb = xgb.XGBRegressor(n_estimators=100, max_depth=4, learning_rate=0.08, random_state=42)
+    model_xgb.fit(features, target)
+    df["XGBoost Forecast"] = model_xgb.predict(features)
 
-elif "CatBoost" in selected_model:
-    model = CatBoostRegressor(iterations=100, depth=4, verbose=0, random_seed=42)
-    model.fit(features, target)
-    df["CatBoost Forecast"] = model.predict(features)
+if "CatBoost Forecast" in selected_models:
+    model_cat = CatBoostRegressor(iterations=100, depth=4, verbose=0, random_seed=42)
+    model_cat.fit(features, target)
+    df["CatBoost Forecast"] = model_cat.predict(features)
 
-elif "Random Forest" in selected_model:
-    model = RandomForestRegressor(n_estimators=100, max_depth=5, random_state=42)
-    model.fit(features, target)
-    df["Random Forest Forecast"] = model.predict(features)
-
-active_col = "Day-Ahead Price (€/MWh)" if "Actual" in selected_model else selected_model
+if "Random Forest Forecast" in selected_models:
+    model_rf = RandomForestRegressor(n_estimators=100, max_depth=5, random_state=42)
+    model_rf.fit(features, target)
+    df["Random Forest Forecast"] = model_rf.predict(features)
 
 
 # --- DASHBOARD UI ---
@@ -121,18 +121,22 @@ st.title("⚡ Short-Term Power Market Trading Simulator")
 st.markdown(f"### 📍 Active Market: **{MARKET_NAMES[selected_bzn]}**")
 
 col1, col2, col3, col4 = st.columns(4)
-col1.metric("Selected Model", selected_model)
-col2.metric("Active Model Price", f"{df[active_col].iloc[-1]:.2f} €/MWh")
+col1.metric("Active Models", f"{len(selected_models)} Selected")
+col2.metric("Latest Actual Price", f"{df['Day-Ahead Price (€/MWh)'].iloc[-1]:.2f} €/MWh")
 col3.metric("Solar Irradiance", f"{df['Solar Irradiance (W/m²)'].iloc[-1]} W/m²")
 col4.metric("Wind Speed (100m)", f"{df['Wind Speed (km/h)'].iloc[-1]} km/h")
 
 st.markdown("---")
 
-st.subheader(f"📈 Price Horizon vs. Model Predictions ({selected_bzn})")
-st.line_chart(df[[active_col, "Day-Ahead Price (€/MWh)"]])
+# Main Multi-Model Line Chart
+st.subheader(f"📈 Model Comparison vs. Actual Spot Price ({selected_bzn})")
+
+# Always plot Actual Spot Price along with any selected models
+chart_columns = ["Day-Ahead Price (€/MWh)"] + selected_models
+st.line_chart(df[chart_columns])
 
 st.subheader("☀️ Renewable Generation Drivers")
 st.line_chart(df[["Solar Irradiance (W/m²)", "Wind Speed (km/h)"]])
 
-with st.expander("🔍 Explore Raw Price & Feature Matrix"):
-    st.dataframe(df)
+with st.expander("🔍 Explore Raw Price & Forecast Matrix"):
+    st.dataframe(df[chart_columns + ["Solar Irradiance (W/m²)", "Wind Speed (km/h)"]])
