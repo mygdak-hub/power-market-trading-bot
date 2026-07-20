@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 import requests
 
-# Forecasting ML Models
+# ML Forecasting Models
 import lightgbm as lgb
 import xgboost as xgb
 from catboost import CatBoostRegressor
@@ -34,7 +34,6 @@ selected_bzn = st.sidebar.selectbox(
     index=0
 )
 
-# 1. TRADING HORIZON SELECTION
 market_horizon = st.sidebar.radio(
     "Select Market Product Horizon",
     options=[
@@ -45,7 +44,6 @@ market_horizon = st.sidebar.radio(
     index=0
 )
 
-# 2. MODEL SELECTION
 selected_models = st.sidebar.multiselect(
     "Select Forecasting Models to Compare",
     options=[
@@ -100,13 +98,10 @@ with st.spinner("Fetching Market Data..."):
     df_weather = fetch_weather_data()
     df = pd.merge(df_prices, df_weather, left_index=True, right_index=True, how="inner")
 
-# --- DERIVE INTRADAY & FORWARD MARKET DATA ---
-# Synthetic Intraday spread volatility model based on real solar/wind ramp rates
+# --- MARKET HORIZONS ---
 np.random.seed(42)
 ramp_factor = (df["Solar Irradiance (W/m²)"].diff().fillna(0) / 100)
 df["Intraday Continuous (€/MWh)"] = df["Day-Ahead Price (€/MWh)"] + (ramp_factor * 5) + np.random.normal(0, 3, len(df))
-
-# Forward D+1 Shifted Curve
 df["Next-Day Forward Curve (€/MWh)"] = df["Day-Ahead Price (€/MWh)"].shift(-24).bfill()
 
 # --- FEATURE ENGINEERING ---
@@ -119,7 +114,6 @@ df_feat["DayOfWeek"] = df_feat.index.dayofweek
 feature_cols = ["Solar Irradiance (W/m²)", "Wind Speed (km/h)", "Price_Lag24", "Price_Lag48", "Hour", "DayOfWeek"]
 X = df_feat[feature_cols].fillna(0)
 
-# Set target based on selected horizon
 if "Intraday" in market_horizon:
     y = df_feat["Intraday Continuous (€/MWh)"].fillna(0)
     base_price_col = "Intraday Continuous (€/MWh)"
@@ -131,29 +125,41 @@ else:
     base_price_col = "Day-Ahead Price (€/MWh)"
 
 
-# --- TRAIN ML MODELS ---
+# --- TRAIN ML MODELS & CALCULATE RESIDUAL ERRORS ---
+error_cols = []
+
 if "24h Moving Average Trend" in selected_models:
     df["24h Moving Average Trend"] = df[base_price_col].rolling(window=24, min_periods=1).mean()
+    df["Error: 24h Moving Avg"] = df[base_price_col] - df["24h Moving Average Trend"]
+    error_cols.append("Error: 24h Moving Avg")
 
 if "LEAR (Lasso AutoRegressive)" in selected_models:
     model_lear = LassoCV(cv=3, random_state=42)
     model_lear.fit(X, y)
     df["LEAR (Lasso AutoRegressive)"] = model_lear.predict(X)
+    df["Error: LEAR"] = df[base_price_col] - df["LEAR (Lasso AutoRegressive)"]
+    error_cols.append("Error: LEAR")
 
 if "Deep Neural Net (DNN)" in selected_models:
     model_dnn = MLPRegressor(hidden_layer_sizes=(64, 32), max_iter=500, random_state=42)
     model_dnn.fit(X, y)
     df["Deep Neural Net (DNN)"] = model_dnn.predict(X)
+    df["Error: DNN"] = df[base_price_col] - df["Deep Neural Net (DNN)"]
+    error_cols.append("Error: DNN")
 
 if "LightGBM Forecast" in selected_models:
     model_lgb = lgb.LGBMRegressor(n_estimators=100, max_depth=4, verbose=-1, random_state=42)
     model_lgb.fit(X, y)
     df["LightGBM Forecast"] = model_lgb.predict(X)
+    df["Error: LightGBM"] = df[base_price_col] - df["LightGBM Forecast"]
+    error_cols.append("Error: LightGBM")
 
 if "CatBoost Forecast" in selected_models:
     model_cat = CatBoostRegressor(iterations=100, depth=4, verbose=0, random_seed=42)
     model_cat.fit(X, y)
     df["CatBoost Forecast"] = model_cat.predict(X)
+    df["Error: CatBoost"] = df[base_price_col] - df["CatBoost Forecast"]
+    error_cols.append("Error: CatBoost")
 
 if "Stacked EPF Ensemble" in selected_models:
     estimators = [
@@ -164,6 +170,8 @@ if "Stacked EPF Ensemble" in selected_models:
     stack_model = StackingRegressor(estimators=estimators, final_estimator=LassoCV(cv=3, random_state=42))
     stack_model.fit(X, y)
     df["Stacked EPF Ensemble"] = stack_model.predict(X)
+    df["Error: Stacked Ensemble"] = df[base_price_col] - df["Stacked EPF Ensemble"]
+    error_cols.append("Error: Stacked Ensemble")
 
 
 # --- DECISION SUPPORT LAYER LOGIC ---
@@ -215,10 +223,16 @@ banner_col3.metric("Projected Arbitrage Spread", f"{projected_spread:.2f} €/MW
 
 st.markdown("---")
 
-# Charting
+# Chart 1: Price Curve & Models
 st.subheader(f"📈 Price Curve & Models ({market_horizon})")
 chart_cols = [base_price_col] + selected_models
 st.line_chart(df[chart_cols])
+
+# Chart 2: Model Residual Delta / Forecast Errors
+if error_cols:
+    st.subheader("📉 Forecast Variance & Delta (€/MWh Residual Error)")
+    st.caption("Shows difference between actual market clearing price and model forecast (Actual - Predicted). Near zero indicates high precision.")
+    st.line_chart(df[error_cols])
 
 # Execution Table
 st.subheader("📋 Next 24-Hour Execution Schedule")
