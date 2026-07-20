@@ -9,7 +9,7 @@ import xgboost as xgb
 from catboost import CatBoostRegressor
 from sklearn.linear_model import LassoCV
 from sklearn.neural_network import MLPRegressor
-from sklearn.ensemble import StackingRegressor, RandomForestRegressor
+from sklearn.ensemble import StackingRegressor
 
 st.set_page_config(page_title="Power Market Simulator", layout="wide")
 
@@ -89,14 +89,19 @@ with st.spinner("Fetching Live Market & Weather Inputs..."):
     df_weather = fetch_weather_data()
     df = pd.merge(df_prices, df_weather, left_index=True, right_index=True, how="inner")
 
-# --- EPF FEATURE ENGINEERING (Autoregressive Lags & Calendar Features) ---
+# --- EPF FEATURE ENGINEERING & CLEANING ---
 df_feat = df.copy()
 
-# Add Day-Ahead Autoregressive Lags (24h and 48h prior)
-df_feat["Price_Lag24"] = df_feat["Day-Ahead Price (€/MWh)"].shift(24).bfill()
-df_feat["Price_Lag48"] = df_feat["Day-Ahead Price (€/MWh)"].shift(48).bfill()
+# 1. Create Day-Ahead Autoregressive Lags
+df_feat["Price_Lag24"] = df_feat["Day-Ahead Price (€/MWh)"].shift(24)
+df_feat["Price_Lag48"] = df_feat["Day-Ahead Price (€/MWh)"].shift(48)
 
-# Temporal / Calendar Inputs
+# 2. Fill Missing Values (bfill/ffill handles top rows created by shifting)
+df_feat["Price_Lag24"] = df_feat["Price_Lag24"].bfill().ffill()
+df_feat["Price_Lag48"] = df_feat["Price_Lag48"].bfill().ffill()
+df_feat["Day-Ahead Price (€/MWh)"] = df_feat["Day-Ahead Price (€/MWh)"].bfill().ffill()
+
+# 3. Temporal Inputs
 df_feat["Hour"] = df_feat.index.hour
 df_feat["DayOfWeek"] = df_feat.index.dayofweek
 
@@ -105,8 +110,9 @@ feature_cols = [
     "Price_Lag24", "Price_Lag48", "Hour", "DayOfWeek"
 ]
 
-X = df_feat[feature_cols]
-y = df_feat["Day-Ahead Price (€/MWh)"]
+# Ensure zero NaN values exist in X or y
+X = df_feat[feature_cols].fillna(0)
+y = df_feat["Day-Ahead Price (€/MWh)"].fillna(0)
 
 
 # --- TRAIN SELECTED EPF MODELS ---
@@ -119,7 +125,7 @@ if "LEAR (Lasso AutoRegressive)" in selected_models:
     df["LEAR (Lasso AutoRegressive)"] = model_lear.predict(X)
 
 if "Deep Neural Net (DNN)" in selected_models:
-    model_dnn = MLPRegressor(hidden_layer_sizes=(64, 32), max_iter=300, random_state=42)
+    model_dnn = MLPRegressor(hidden_layer_sizes=(64, 32), max_iter=500, random_state=42)
     model_dnn.fit(X, y)
     df["Deep Neural Net (DNN)"] = model_dnn.predict(X)
 
