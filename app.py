@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 import requests
 
-# ML Forecasting Models
+# ML & EPF Forecasting Libraries
 import lightgbm as lgb
 import xgboost as xgb
 from catboost import CatBoostRegressor
@@ -54,7 +54,7 @@ selected_models = st.sidebar.multiselect(
         "CatBoost Forecast",
         "24h Moving Average Trend"
     ],
-    default=["LEAR (Lasso AutoRegressive)", "Stacked EPF Ensemble"]
+    default=["LEAR (Lasso AutoRegressive)", "CatBoost Forecast", "Stacked EPF Ensemble"]
 )
 
 st.sidebar.markdown("---")
@@ -97,7 +97,7 @@ with st.spinner("Fetching Market Data..."):
     df_prices = fetch_fraunhofer_prices(selected_bzn)
     df_weather = fetch_weather_data()
     
-    # 1. Standardize both indexes to UTC timezone to eliminate 1-2 hour shifts
+    # Timezone standardization to UTC to avoid shifts
     if df_prices.index.tz is None:
         df_prices.index = df_prices.index.tz_localize("UTC")
     else:
@@ -107,8 +107,7 @@ with st.spinner("Fetching Market Data..."):
         df_weather.index = df_weather.index.tz_localize("UTC")
     else:
         df_weather.index = df_weather.index.tz_convert("UTC")
-    
-    # 2. Merge aligned UTC datasets
+        
     df = pd.merge(df_prices, df_weather, left_index=True, right_index=True, how="inner")
 
 # --- MARKET HORIZONS ---
@@ -168,7 +167,7 @@ if "LightGBM Forecast" in selected_models:
     error_cols.append("Error: LightGBM")
 
 if "CatBoost Forecast" in selected_models:
-    model_cat = CatBoostRegressor(iterations=100, depth=4, verbose=0, random_seed=42)
+    model_cat = CatBoostRegressor(iterations=200, depth=6, learning_rate=0.05, verbose=0, random_seed=42)
     model_cat.fit(X, y)
     df["CatBoost Forecast"] = model_cat.predict(X)
     df["Error: CatBoost"] = df[base_price_col] - df["CatBoost Forecast"]
@@ -244,7 +243,7 @@ st.line_chart(df[chart_cols])
 # Chart 2: Model Residual Delta / Forecast Errors
 if error_cols:
     st.subheader("📉 Forecast Variance & Delta (€/MWh Residual Error)")
-    st.caption("Shows difference between actual market clearing price and model forecast (Actual - Predicted). Near zero indicates high precision.")
+    st.caption("Difference between actual market clearing price and model forecast (Actual - Predicted).")
     st.line_chart(df[error_cols])
 
 # Execution Table
@@ -256,3 +255,50 @@ st.dataframe(summary_df.style.map(
     else ('background-color: #f8d7da; color: #721c24;' if 'DISCHARGE' in str(val) else ''),
     subset=['Trading Signal']
 ))
+
+st.markdown("---")
+
+# --- 💰 MODEL BACKTESTED EARNINGS (P&L) COMPARISON TABLE ---
+st.subheader(f"💰 Realized Earnings (P&L) Comparison by Model ({battery_capacity_mwh} MWh Asset)")
+st.caption("Calculates total revenue generated if trades were executed at actual market prices whenever a model's predicted price crossed your strategy thresholds.")
+
+pnl_results = []
+
+# Include benchmark actual prices alongside selected models
+models_to_test = selected_models if selected_models else [base_price_col]
+
+for model in models_to_test:
+    # 1. Identify buy/sell hours based on model's predictions
+    buy_mask = df[model] <= buy_threshold
+    sell_mask = df[model] >= sell_threshold
+    
+    # 2. Calculate actual money spent and earned using REAL base prices
+    charge_cost = (df.loc[buy_mask, base_price_col] * battery_capacity_mwh).sum()
+    discharge_revenue = (df.loc[sell_mask, base_price_col] * battery_capacity_mwh).sum()
+    
+    net_pnl = discharge_revenue - charge_cost
+    charge_cycles = buy_mask.sum()
+    discharge_cycles = sell_mask.sum()
+    
+    pnl_results.append({
+        "Forecasting Model": model,
+        "Charge Cycles (Hours)": charge_cycles,
+        "Discharge Cycles (Hours)": discharge_cycles,
+        "Total Charging Cost (€)": f"€{charge_cost:,.2f}",
+        "Total Revenue (€)": f"€{discharge_revenue:,.2f}",
+        "Net Realized Profit (€)": net_pnl
+    })
+
+pnl_df = pd.DataFrame(pnl_results)
+
+# Display P&L metric cards for top performers
+top_model = pnl_df.sort_values(by="Net Realized Profit (€)", ascending=False).iloc[0]
+
+metric_col1, metric_col2 = st.columns(2)
+metric_col1.metric("🏆 Best Performing Model", top_model["Forecasting Model"])
+metric_col2.metric("Highest Realized Profit", f"€{top_model['Net Realized Profit (€)']:,.2f}")
+
+# Format net P&L with Euro sign for dataframe display
+pnl_df["Net Realized Profit (€)"] = pnl_df["Net Realized Profit (€)"].apply(lambda x: f"€{x:,.2f}")
+
+st.dataframe(pnl_df, use_container_width=True)
