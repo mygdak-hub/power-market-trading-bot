@@ -1,7 +1,8 @@
 streamlit
 pandas
 numpy
-lightgbm
-plotly
-openmeteo-requests
 requests
+lightgbm
+xgboost
+catboost
+scikit-learn
