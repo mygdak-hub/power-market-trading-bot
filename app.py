@@ -32,7 +32,6 @@ selected_bzn = st.sidebar.selectbox(
     index=0
 )
 
-# MULTI-SELECT WIDGET FOR MODELS
 selected_models = st.sidebar.multiselect(
     "Select Forecasting Models to Compare",
     options=[
@@ -42,11 +41,12 @@ selected_models = st.sidebar.multiselect(
         "Random Forest Forecast",
         "24h Moving Average Trend"
     ],
-    default=["LightGBM Forecast", "CatBoost Forecast"]  # Pre-select two for initial comparison
+    default=["LightGBM Forecast"]
 )
 
 st.sidebar.markdown("---")
-st.sidebar.header("Strategy Parameters")
+st.sidebar.header("⚡ Battery & Strategy Parameters")
+battery_capacity_mwh = st.sidebar.number_input("Battery Storage Capacity (MWh)", value=10, min_value=1)
 buy_threshold = st.sidebar.slider("Charge Trigger Price (€/MWh)", min_value=0, max_value=60, value=35)
 sell_threshold = st.sidebar.slider("Discharge Trigger Price (€/MWh)", min_value=60, max_value=200, value=90)
 
@@ -91,7 +91,7 @@ features["Hour"] = df.index.hour
 features["DayOfWeek"] = df.index.dayofweek
 target = df["Day-Ahead Price (€/MWh)"]
 
-# --- TRAIN & PREDICT SELECTED MODELS ---
+# --- TRAIN SELECTED MODELS ---
 if "24h Moving Average Trend" in selected_models:
     df["24h Moving Average Trend"] = df["Day-Ahead Price (€/MWh)"].rolling(window=12, min_periods=1).mean()
 
@@ -116,27 +116,67 @@ if "Random Forest Forecast" in selected_models:
     df["Random Forest Forecast"] = model_rf.predict(features)
 
 
+# --- DECISION SUPPORT LAYER (DSL) LOGIC ---
+primary_model = selected_models[0] if selected_models else "Day-Ahead Price (€/MWh)"
+
+def generate_decision(row, model_col, buy_t, sell_t):
+    price = row[model_col]
+    if price <= buy_t:
+        return "🟢 CHARGE (BUY)"
+    elif price >= sell_t:
+        return "🔴 DISCHARGE (SELL)"
+    else:
+        return "⚪ HOLD (IDLE)"
+
+df["Trading Signal"] = df.apply(generate_decision, axis=1, model_col=primary_model, buy_t=buy_threshold, sell_t=sell_threshold)
+
+current_signal = df["Trading Signal"].iloc[-1]
+current_price = df[primary_model].iloc[-1]
+
+# Estimated daily P&L calculation based on capacity
+charge_hours = df[df["Trading Signal"] == "🟢 CHARGE (BUY)"]
+discharge_hours = df[df["Trading Signal"] == "🔴 DISCHARGE (SELL)"]
+
+avg_buy_p = charge_hours[primary_model].mean() if not charge_hours.empty else 0
+avg_sell_p = discharge_hours[primary_model].mean() if not discharge_hours.empty else 0
+projected_spread = max(0, avg_sell_p - avg_buy_p)
+estimated_daily_pnl = projected_spread * battery_capacity_mwh
+
+
 # --- DASHBOARD UI ---
 st.title("⚡ Short-Term Power Market Trading Simulator")
 st.markdown(f"### 📍 Active Market: **{MARKET_NAMES[selected_bzn]}**")
 
-col1, col2, col3, col4 = st.columns(4)
-col1.metric("Active Models", f"{len(selected_models)} Selected")
-col2.metric("Latest Actual Price", f"{df['Day-Ahead Price (€/MWh)'].iloc[-1]:.2f} €/MWh")
-col3.metric("Solar Irradiance", f"{df['Solar Irradiance (W/m²)'].iloc[-1]} W/m²")
-col4.metric("Wind Speed (100m)", f"{df['Wind Speed (km/h)'].iloc[-1]} km/h")
+st.markdown("---")
+
+# 🤖 DECISION SUPPORT BANNER
+st.subheader("🤖 Algorithmic Decision Support Recommendation")
+
+banner_col1, banner_col2, banner_col3 = st.columns(3)
+
+if "CHARGE" in current_signal:
+    banner_col1.success(f"### Current Action: {current_signal}")
+elif "DISCHARGE" in current_signal:
+    banner_col1.error(f"### Current Action: {current_signal}")
+else:
+    banner_col1.info(f"### Current Action: {current_signal}")
+
+banner_col2.metric(f"Current Signal Price ({primary_model})", f"{current_price:.2f} €/MWh")
+banner_col3.metric("Projected Daily Arbitrage Spread", f"{projected_spread:.2f} €/MWh", delta=f"~€{estimated_daily_pnl:.2f} / day")
 
 st.markdown("---")
 
-# Main Multi-Model Line Chart
-st.subheader(f"📈 Model Comparison vs. Actual Spot Price ({selected_bzn})")
+# Visual Charting
+st.subheader(f"📈 Model Prices vs. Execution Triggers")
+chart_cols = ["Day-Ahead Price (€/MWh)"] + selected_models
+st.line_chart(df[chart_cols])
 
-# Always plot Actual Spot Price along with any selected models
-chart_columns = ["Day-Ahead Price (€/MWh)"] + selected_models
-st.line_chart(df[chart_columns])
+# Execution Signals Schedule
+st.subheader("📋 Next 24-Hour Automated Execution Schedule")
+summary_df = df[[primary_model, "Trading Signal", "Solar Irradiance (W/m²)", "Wind Speed (km/h)"]].head(24)
 
-st.subheader("☀️ Renewable Generation Drivers")
-st.line_chart(df[["Solar Irradiance (W/m²)", "Wind Speed (km/h)"]])
-
-with st.expander("🔍 Explore Raw Price & Forecast Matrix"):
-    st.dataframe(df[chart_columns + ["Solar Irradiance (W/m²)", "Wind Speed (km/h)"]])
+st.dataframe(summary_df.style.map(
+    lambda val: 'background-color: #d4edda; color: #155724;' if 'CHARGE' in str(val) 
+    else ('background-color: #f8d7da; color: #721c24;' if 'DISCHARGE' in str(val) else ''),
+    subset=['Trading Signal']
+))
